@@ -1,0 +1,1061 @@
+#!/usr/bin/env python3
+# Benchmark two programs/scripts against each other
+# tags: benchmark devel
+# noinspection PyPep8
+
+import argparse
+import enum
+import os
+import psutil
+import re
+import resource
+import subprocess
+import sys
+import stat
+import subprocess as subproc
+import shlex
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+
+prog = os.path.basename(__file__)
+prog_name = os.path.basename(__file__).replace(".py", "")
+# Everything this script writes, is written below this dir
+workdir_path = f"/tmp/{prog_name}"
+
+file_items = "items.txt"
+script_init_once = "init_once"
+script_init_item = "init_item"
+
+file_cmdline_args = "commandline.txt"
+
+# human readable result file
+file_result_text = "results.txt"
+# CSV result file (used as cache when resuming a run)
+file_result_csv = "results.csv"
+# Progress file that can be tailed
+file_progress = "progress.txt"
+
+# Name of config example directory written with -w option
+config_example_dir = f"{prog_name}-example"
+
+# Colorize cpu_percent usage numbers red if below bad and green if higher than good
+nproc = psutil.cpu_count(logical=False)
+cpu_usage_1core, cpu_usage_2cores = (1 / nproc), (2 / nproc)
+cpu_percent_bad = 100 * (cpu_usage_1core + cpu_usage_2cores) / 2
+cpu_percent_fair = 50
+cpu_percent_good = 80
+
+
+################################################################################
+#
+################################################################################
+
+class Ansi:
+    """
+
+    """
+    reset, bold, dim, italic, under, inv = "", "", "", "", "", ""
+
+    class fg:
+        black, red, green, yellow, blue, magenta, cyan, white = "", "", "", "", "", "", "", ""
+        iblack, ired, igreen, iyellow, iblue, imagenta, icyan, iwhite = "", "", "", "", "", "", "", ""
+
+    class bg(fg):
+        pass
+
+    _initialized = False
+
+    @staticmethod
+    def enable(force=False):
+        """
+        Call this method to enable/disable ANSI colors.
+        By default, all `Ansi.fg` and `Ansi.reset` etc. are empty strings.
+        After calling this function, they will have proper ANSI escape values
+
+        :param force: True to force use of colors
+        """
+        Ansi._initialized = True
+
+        colorize = force or (sys.stdout.isatty() and os.name != 'nt')
+        if not colorize:
+            return
+
+        # dicts are ordered by default from Python 3.6
+        # and thus this code will only work with Python 3.6+
+
+        # codes for foreground
+        # black, red, green, yellow, blue, magenta, cyan, white
+        # and same colors in intense version
+        codes = iter([
+            30, 31, 32, 33, 34, 35, 36, 37,
+            90, 91, 92, 93, 94, 95, 96, 97])
+        for k in Ansi.fg.__dict__.keys():
+            if not k.startswith("__"):
+                code = next(codes)
+                setattr(Ansi.fg, k, f"\033[{code}m")
+                setattr(Ansi.bg, k, f"\033[{code + 10}m")
+
+        # codes for reset, bold, din, italic, under, inv
+        codes = iter([
+            0, 1, 2, 3, 4, 7])
+        for k in Ansi.__dict__.keys():
+            if type(Ansi.__dict__[k]) == str and not k.startswith("__"):
+                code = next(codes)
+                setattr(Ansi, k, f"\033[{code}m")
+
+
+class Log(object):
+    """
+    Log() can be instanced globally or as a member of the main class
+    """
+
+    class Level(enum.IntEnum):
+        Note = -1
+        Info = 0
+        Verbose = 1
+        Debug = 2
+        Trace = 3
+        Crazy = 4
+
+    class style:
+        note = "fg.iyellow"
+        info = "fg.white bold"
+        norm = ""
+        verb = "fg.white"
+        debug = "fg.icyan"
+        trace = "fg.cyan italic"
+        warn = "fg.iyellow"
+        error = "fg.ired"
+        ok = "fg.igreen"
+        bad = "fg.ired"
+        shell = "fg.igreen"
+        lite = "fg.white bold"
+
+    _initialized = False
+
+    def __init__(self, level=0, with_progress=False, with_tips=True, with_shell=True):
+        self.level = level
+        self.with_progress = with_progress
+        # True to show user tips
+        self.enable_tips = with_tips
+        # True to show shell commands
+        self.enable_shell = with_shell
+
+        if Log._initialized:
+            return
+
+        # initialize ANSI colors if user forgot to do so
+        if not Ansi._initialized:
+            Ansi.enable()
+
+        Log._initialized = True
+        # expand the colors into the Log.style attributes
+        for k,v in Log.style.__dict__.items():
+            if type(Log.style.__dict__[k]) == str and not k.startswith("__"):
+                names = v.split(" ")
+                s = ""
+                for name in names:
+                    if not name:
+                        continue
+                    if name.startswith("fg."):
+                        s += Ansi.fg.__dict__[name[3:]]
+                    else:
+                        s += Ansi.__dict__[name]
+                setattr(Log.style, k, s)
+
+    def note(self, s, level=-1):
+        """Log notice message that is more noteworthy than `info`"""
+        if self.level >= level:
+            print(f"{Log.style.note}{s}{Ansi.reset}")
+
+    def info(self, s, level=0):
+        """Log normal info message colorized specially"""
+        if self.level >= level:
+            print(f"{Log.style.info}{s}{Ansi.reset}")
+
+    def norm(self, s, level=0):
+        """Log normal info message (usaully neutral/white color)"""
+        if self.level >= level:
+            print(f"{Log.style.norm}{s}{Ansi.reset}")
+
+    def verb(self, s, level=1):
+        """Log message at verbose level (more detail)"""
+        if self.level >= level:
+            print(f"{Log.style.verb}{s}{Ansi.reset}")
+
+    def debug(self, s, level=2):
+        """Log message at debug level (lots of detail)"""
+        if self.level >= level:
+            print(f"{Log.style.debug}{s}{Ansi.reset}")
+
+    def trace(self, s, level=3):
+        """Log message at trace level (tons of detail)"""
+        if self.level >= level:
+            print(f"{Log.style.trace}{s}{Ansi.reset}")
+
+    def error(self, s):
+        print(f"{Log.style.error}ERROR: {s}{Ansi.reset}", file=sys.stderr)
+
+    def warn(self, s):
+        print(f"{Log.style.warn}WARNING: {s}{Ansi.reset}", file=sys.stderr)
+
+    def shell(self, s):
+        if self.enable_shell:
+            print(f"{Log.style.shell}{s}{Ansi.reset}")
+
+    def lite(self, s, level=0):
+        if self.level >= level:
+            print(f"{Log.style.lite}{s}{Ansi.reset}")
+
+log = Log()
+
+def die(s):
+    log.error(s)
+    sys.exit(1)
+
+
+################################################################################
+
+import concurrent.futures as futures
+
+def run_command(cmdline, cwd=None, logfile=None, env=None):
+
+    def popen_pipe(proc, stdfile):
+        with open(logfile, "a") as f:
+            while proc.poll() is None:
+                line = stdfile.readline().decode("utf8", "backslashreplace")
+                f.write(line)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+            # Write the rest from the buffer
+            line = stdfile.read().decode("utf8", "backslashreplace")
+            f.write(line)
+            f.flush()
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+    if not logfile:
+        logfile = "/dev/null"
+    if not env:
+        env = {}
+
+    args = shlex.split(cmdline)
+    with subproc.Popen(args, stdout=subproc.PIPE, stderr=subproc.PIPE, cwd=cwd, env=env) as proc:
+        with futures.ThreadPoolExecutor(2) as pool:
+            jobs = [
+                pool.submit(popen_pipe, proc, proc.stdout),
+                pool.submit(popen_pipe, proc, proc.stderr),
+            ]
+            for job in futures.as_completed(jobs):
+                try:
+                    job.result()
+                except Exception as e:
+                    print("Exception in thread: ", e)
+                    break
+
+    return proc.returncode
+
+
+def make_workdir_path(default_path=workdir_path, workdir=None, with_ts=False) -> Path:
+    if workdir:
+        workdir = os.path.expanduser(workdir)
+    if not workdir:
+        path = Path(default_path) / Path().cwd().name
+    elif workdir.startswith("+"):
+        path = Path(default_path) / workdir[1:]
+    elif workdir.startswith("/"):
+        path = Path(workdir)
+    else:
+        path = Path.cwd() / workdir
+
+    if with_ts:
+        path += time.strftime("/%Y-%m-%d-%H-%M-%S", time.gmtime(time.time()))
+
+    return path
+
+def get_lscpu_as_dict():
+    proc = subproc.run("lscpu", stdout=subprocess.PIPE, universal_newlines=True)
+    d = {}
+    for line in proc.stdout.splitlines():
+        k, v = line.split(":")
+        k, v = k.strip(), v.strip()
+        d[k] = v
+
+    return d
+
+def get_execution_env_as_string():
+    d = get_lscpu_as_dict()
+    s = f"{d['Model name']}, {d['CPU(s)']} cores/threads"
+    return s
+
+
+################################################################################
+
+class Step(object):
+    def __init__(self, stage=None, item=None, exitcode=None, elapsed=0, cpu_percent=0):
+        self.stage = stage
+        self.item = item
+        self.started = time.time()
+        self.exitcode = int(exitcode) if type(exitcode) == str else None
+        self.elapsed = float(elapsed)
+        # How much CPU time the step used (0-100)
+        self.cpu_percent = float(cpu_percent)
+        # resource.getrusage() over the duration of the step
+        self.rusage = None
+        # Variable used for generation of script filename
+        # Does not contain spaces and slashes
+        self.item_safe = self.item
+        if self.item_safe.startswith("/"):
+            self.item_safe = self.item_safe[1:]
+        self.item_safe = self.item_safe.replace("/", "_").replace(" ", "_")
+
+    def __str__(self):
+        return f"<Step {self.stage}.{self.item} exit={self.exitcode} elapsed={self.elapsed:.1f}>"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class Benchmark(object):
+    def __init__(self, workdir: Path ="", config_dir="."):
+        """
+        Initialize Benchmark object using output dir `workdir` and
+        configuration in/from `config_dir`
+
+        :param workdir:
+        :param config_dir:
+        """
+        self.workdir = workdir
+        self.workdir.mkdir(exist_ok=True, parents=True)
+
+        self.config_dir = os.path.abspath(config_dir)
+
+        # Names of the items to work on
+        self.items = []
+
+        # Stage names (picked up from the located scripts)
+        self.all_stages = []
+
+        # Stage names actually being executed (selected by user)
+        self.stages = []
+
+        # dictionary of scripts: { 'init_global': <PATH>, 'init_item', <PATH>, 'A': <PATH>, ... }
+        self.scripts = {}
+
+        self.started = time.time()
+        self.dryrun = False
+
+        # True if we already loaded file_result_csv
+        self.result_csv_loaded = False
+
+        self._find_scripts(config_dir)
+
+        # Results of step executions:
+        #     { 'A': [ Step, Step, ... ], 'B': [ Step, Step, ... ] }
+        self.results = { stage:{} for stage in self.all_stages }
+
+
+    def _find_scripts(self, path):
+        """
+        Locate all <stage> scripts directory `path`.
+
+        :param path:
+        """
+        # sys.exit(1)
+        abspath = os.path.abspath(path)
+        for f in sorted(os.listdir(path)):
+            if not (os.path.isfile(f) and os.stat(f).st_mode & stat.S_IXUSR):
+                log.verb(f"Ignoring {f} because it is not executable")
+                continue
+            if f.endswith("~") or f.endswith(".zzz"):
+                continue
+
+            self.scripts[f] = os.path.join(abspath, f)
+
+            base, suffix = os.path.splitext(f)
+            if base not in (script_init_once, script_init_item):
+                self.all_stages.append(f)
+
+    def _write_progress(self, step):
+        filepath = os.path.join(self.workdir, file_progress)
+        if not os.path.isfile(filepath):
+            log.note(f"Writing progress info to {filepath}")
+            log.note(f"Track it with: tail -F {filepath}")
+
+        with open(filepath, "a+") as fp:
+            now_str = time.strftime("%H:%M:%S", time.gmtime(time.time()))
+            if step.elapsed == 0:
+                print(f"{now_str} executing stage '{step.stage}' name '{step.item}", file=fp)
+            else:
+                print(f"{now_str} completed stage '{step.stage}' name '{step.item}: exit={step.exitcode} elapsed={step.elapsed:.1f}s", file=fp)
+            fp.flush()
+
+    def select_items(self, s):
+        if s:
+            items = s.split(",")
+        else:
+            filepath = os.path.join(self.config_dir, file_items)
+            log.verb(f"Reading <items> from {filepath}")
+            if not os.path.isfile(filepath):
+                log.error(f"File '{file_items}' not found and no items supplied on command-line")
+                raise
+            lines = open(filepath, "r").readlines()
+            items = []
+            for line in lines:
+                line = line.strip()
+                if line.startswith("#") or not line:
+                    continue
+                if line == "EOF":
+                    break
+                items.append(line)
+
+        self.items = items
+
+    def select_stages(self, stages):
+        self.stages = self.all_stages
+
+        # user wants default stages, so no filtering
+        if not stages:
+            return
+
+        # user doesn't have to give the "N-" prefix when specifying a stage
+        # so build a list of aliases
+        aliases = {}
+        for s in self.all_stages:
+            if s[0] in "0123456789" and s[1] in ('-', '_'):
+                aliases[s[2:]] = s
+            aliases[s] = s
+
+        def assert_valid_stage_name(x):
+            if x not in aliases:
+                raise ValueError(f"Stage '{x}' script not found. Did you misspell the name?")
+
+        has_excludes = any([x for x in stages if x[0] == '/'])
+
+        if has_excludes:
+            # user supplied list of what stages to exclude
+            # remove stages that user supplied with "/" as prefix
+            for a in stages:
+                if a[0] in ('/', ):
+                    stage = aliases[a[1:]]
+                    assert_valid_stage_name(stage)
+                    self.stages.remove(stage)
+        else:
+            # user supplied list of what stages to include
+            new_stages = []
+            for a in stages:
+                stage = aliases[a]
+                assert_valid_stage_name(stage)
+                new_stages.append(stage)
+            self.stages = new_stages
+
+        if not self.stages:
+            raise RuntimeError("No stages found: Are you in the wrong directory, missing scripts or did you filter too much?")
+
+    def script_interpolate_and_write(self, step):
+        # Read and interpolate template script
+        script_path = self.scripts[step.stage]
+        srcpath = os.path.join(self.config_dir, script_path)
+        src = open(srcpath, "r").read()
+        log.verb(f"Interpolating {srcpath}")
+        try:
+            # Replace all '{item}' and '{stage}' instances
+            text = src
+            text = re.sub(r"(?<!$){stage}", step.stage, text)
+            text = re.sub(r"(?<!$){item}", step.item, text)
+            text = re.sub(r"(?<!$){item_safe}", step.item_safe, text)
+            #text = src.format(**locals())
+        except KeyError as e:
+            log.error(f"""Script {srcpath} references {e} which is unknown
+Valid interpolations are: {{stage}} and {{item}}""")
+            raise
+
+        # write the interpolated script
+        destpath = os.path.join(self.workdir, f"{step.stage}_{step.item_safe}")
+        log.verb(f"Writing interpolated script to {destpath}")
+        with open(destpath, "w") as f:
+            f.write(text)
+            os.chmod(destpath, os.stat(destpath).st_mode | stat.S_IRWXU)
+
+        return destpath
+
+    def execute(self, stage, item=None):
+        """
+        Run script for given stage and item
+
+        :param stage:   stage name: something like 'a', 'b'
+        :param item:    item item
+        :return:
+        """
+
+        if stage == script_init_once:
+            item = stage
+        elif stage == script_init_item:
+            pass
+        elif stage not in self.stages:
+            raise RuntimeError("Oops")
+
+        if not item:
+            raise ValueError("Argument 'item' missing")
+
+        step = self.cached_result_get(stage, item)
+        if step and (step.exitcode == 0 or self.dryrun):
+            if self.dryrun:
+                log.note("Dryrun step and using previous/cached result")
+            else:
+                log.note("Skipping step and using previous/cached successful result")
+            return step.exitcode
+
+        step = Step(stage=stage, item=item)
+        self._write_progress(step)
+
+        cmd = self.script_interpolate_and_write(step)
+
+        cwd = self.workdir
+        myenv = {'CONFIGDIR': self.config_dir, 'WORKDIR': cwd, 'ITEM': item, 'STAGE': stage}
+        for k,v in myenv.items():
+            os.environ[k] = str(v)
+        env = os.environ
+
+        exitcode = None
+        try:
+            log.shell(cmd)
+            if self.dryrun:
+                exitcode = 0
+            else:
+                logfile = os.path.join(self.workdir, f"{stage}_{step.item_safe}.log")
+
+                rusage_start = resource.getrusage(resource.RUSAGE_CHILDREN)
+                psutil.cpu_percent(interval=None)
+
+                exitcode = run_command(cmd, cwd=cwd, logfile=logfile, env=env)
+
+                rusage = resource.getrusage(resource.RUSAGE_CHILDREN)
+                step.cpu_percent = psutil.cpu_percent(interval=None)
+                step.rusage = resource.struct_rusage(f1-f0 for f0, f1 in zip(rusage_start, rusage))
+
+            step.exitcode = exitcode
+        except Exception as e:
+            traceback.print_exc()
+            step.exitcode = "Exc"
+
+        if self.dryrun:
+            step.elapsed = 0
+        else:
+            step.elapsed = time.time() - step.started
+
+        # If step failed very quickly then don't record the cpu_percent
+        if step.elapsed < 0.1 and exitcode != 0:
+            step.cpu_percent = 0
+
+        # print to CSV/cache file
+        self.cached_result_write(step)
+        self._write_progress(step)
+
+        if stage in self.stages:
+            # store result as one of the registered stages
+            self.results[stage][item] = step
+        else:
+            # if `stage` is unknown, we record it anyway for final time statistics
+            if stage in self.results:
+                self.results[stage][item] = step
+            else:
+                self.results[stage] = {item: step}
+
+        return exitcode
+
+    ###########################################################################
+    # Cache (CSV result file)
+    ###########################################################################
+
+    def cache_results_filepath_get(self):
+        return os.path.join(self.workdir, file_result_csv)
+
+    def cached_result_create_file(self):
+        # If CSV result file does not exist, write ISO8601 date
+        # and CPU model as a comment lines
+        self.cached_result_write_raw(f"# {datetime.now().isoformat()}")
+        s = get_execution_env_as_string()
+        self.cached_result_write_raw(f"# {s}")
+        self.cached_result_write_raw(f"#")
+        s = "stage,item,elapsed,cpu_percent,exitcode"
+        self.cached_result_write_raw(f"# {s}\n")
+
+    def cached_result_write(self, step: Step):
+        if self.dryrun or step.stage in (script_init_once, script_init_item):
+            return
+        line = f"{step.stage},{step.item},{step.elapsed:.1f},{step.cpu_percent:.1f},{step.exitcode}"
+        self.cached_result_write_raw(line)
+
+    def cached_result_write_raw(self, s):
+        filepath_csv = self.cache_results_filepath_get()
+        with open(filepath_csv, "a+") as fp:
+            print(s, file=fp)
+            fp.flush()
+
+    def cached_result_get(self, stage, item):
+        if not self.result_csv_loaded:
+            return
+
+        if stage in (script_init_once, script_init_once):
+            return
+
+        if not stage in self.results or not item in self.results[stage]:
+            return
+
+        return self.results[stage][item]
+
+    def cached_results_load(self):
+        """
+
+        :return:
+        """
+        filepath = self.cache_results_filepath_get()
+        if not os.path.isfile(filepath):
+            return 0
+
+        num_unique = 0
+        log.note(f"Reading cached results from {filepath}")
+        lines = open(filepath, "r").readlines()
+        try:
+            for linenum, line in enumerate(lines):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                stage, item, elapsed, cpu_percent, exitcode = line.split(",")
+
+                # There may be many more result lines than necessary,
+                # e.g. if a <stage.item> has failed multiple times.
+                if item not in self.results[stage]:
+                    num_unique += 1
+
+                step = Step(stage=stage, item=item, exitcode=exitcode, elapsed=elapsed, cpu_percent=cpu_percent)
+                self.results[stage][item] = step
+        except (KeyError, ValueError) as e:
+            die(f"""{e}
+       Failed to load and parse {filepath} at line {linenum}: {line}
+       Maybe because the stage scripts were renamed or the result file format changed?
+       You can either try and fix the file or you can just delete it and restart this script""")
+
+        self.result_csv_loaded = True
+        log.note(f"Loaded {num_unique} results ({len(lines)} lines) from {filepath}")
+        return num_unique
+
+
+    ###########################################################################
+    # Result text file writing
+    ###########################################################################
+
+    def write_textual_result(self):
+        filepath_text = os.path.join(self.workdir, file_result_text)
+        out = open(filepath_text, "w")
+
+        s = get_execution_env_as_string()
+        print(f"CPU: {s}\n", file=out)
+
+        init_str = "init_item "
+        w_item = max([len(item) for item in self.items]) + 1
+        w_prefix_item = w_item + len(init_str)
+
+        print("Initialization execution time:", file=out)
+        stage = script_init_once
+        if stage in self.results:
+            elapsed = self.results[stage][stage].elapsed
+            print(f"{stage:{w_prefix_item}}{elapsed:6.1f}", file=out)
+
+        stage = script_init_item
+        for item in self.items:
+            elapsed = self.results[stage][item].elapsed
+            s = f"{init_str}{item}"
+            print(f"{s:{w_prefix_item}}{elapsed:6.1f}", file=out)
+
+        print("\nMain loop execution time results:\n", file=out)
+
+        # Print first two header lines, s1 and s2 and the separator
+        s1 = "{h:{w}}".format(h="", w=w_item)
+        s2 = "{h:{w}}".format(h="Name", w=w_item)
+        for i, stage in enumerate(self.stages):
+            if i == 0:
+                #      "12345678901234" (width = 14)
+                s2 += f"   time exit cpu"
+                s1 += f"{stage:>16}"
+            else:
+                #      "123456789012345678901" (width = 20)
+                s2 += f"   time exit cpu    rel"
+                s1 += f"{stage:>23}"
+
+        print(s1, file=out)
+        print(s2, file=out)
+        print("-" * len(s2), file=out)
+
+        # Then print the actual result lines
+        for item in self.items:
+            s = f"{item:{w_item}}"
+            stage_first = None
+            for stage in self.stages:
+                step = self.results[stage].get(item)
+                if not step:
+                    continue
+
+                elapsed = f"{step.elapsed:.1f}"
+                q = f"{elapsed:>7}{step.exitcode:>5}"
+
+                if step.exitcode != 0 or step.elapsed < 0.01:
+                    s += f"{Log.style.bad}{q}{Ansi.reset}"
+                else:
+                    s += q
+
+                q = f"{step.cpu_percent:4.0f}"
+                if step.cpu_percent < cpu_percent_bad:
+                    s += f"{Log.style.bad}{q}{Ansi.reset}"
+                elif step.cpu_percent > cpu_percent_good:
+                    s += f"{Log.style.ok}{q}{Ansi.reset}"
+                elif step.cpu_percent < cpu_percent_fair:
+                    s += f"{Ansi.fg.yellow}{q}{Ansi.reset}"
+                else:
+                    s += q
+
+                if stage_first:
+                    if step.exitcode == 0:
+                        step_first = self.results[stage_first][item]
+                        rel = step.elapsed / step_first.elapsed if step_first.elapsed != 0 else 99
+                        if rel > 99:
+                            rel = 99
+                        s += f"{rel:7.2f}"
+                    else:
+                        s += " " * 6
+                else:
+                    stage_first = stage
+
+                s += f"{Ansi.reset}"
+
+            print(s, file=out)
+
+        out.close()
+        print(open(filepath_text, "r").read())
+
+
+################################################################################
+
+def main():
+    workdir = make_workdir_path(default_path=workdir_path, workdir=opt.workdir, with_ts=opt.timestamp)
+    b = Benchmark(workdir=workdir)
+    b.dryrun = opt.dryrun
+
+    b.select_stages(opt.stages)
+    b.select_items(opt.items)
+
+    progress_filepath = os.path.join(b.workdir, file_progress)
+    if os.path.isfile(progress_filepath):
+        os.unlink(progress_filepath)
+
+    log.info(f"Iterating over stages: {' '.join(b.stages)}")
+    log.info(f"Iterating over items:  {' '.join(b.items)}")
+
+    num_cached_results = 0
+    if opt.force:
+        log.note("Forcing re-run of step (ignoring cached results)")
+    else:
+        num_cached_results = b.cached_results_load()
+        if num_cached_results > 0:
+            log.note(f"""Resuming previous run based on cached results.
+    If you want to start afresh then delete the {file_result_csv} file: {b.cache_results_filepath_get()}""")
+        else:
+            # If CSV result file does not exist, create it with header
+            b.cached_result_create_file()
+
+    started = time.time()
+
+    log.info("Running global init")
+    exitcode = b.execute(script_init_once)
+    if exitcode != 0:
+        die(f"init FAILED with exitcode = {exitcode}")
+
+    log.info("Running init once per <item>")
+    for item in b.items:
+        log.info(f"Running init for {item}")
+        exitcode = b.execute(script_init_item, item)
+        if exitcode != 0:
+            die(f"prepare FAILED with exitcode = {exitcode}")
+
+    log.info("Running main benchmark loop")
+    abort = False
+    for item in b.items:
+        for stage in b.stages:
+            log.info(f"Executing stage '{stage}' with item '{item}'")
+            exitcode = b.execute(stage, item)
+            abort = (exitcode != 0 and opt.abort_on_error)
+            if abort:
+                break
+        if abort:
+            break
+
+    log.info("\nResults:")
+    b.write_textual_result()
+
+    elapsed = time.time() - started
+
+    print(f"Processed {len(b.items)} items over {len(b.stages)} stages in {elapsed:.0f}s")
+    log.info(f"Output files are in {b.workdir}")
+    log.norm(f"  {file_result_csv} is CSV file of results")
+    log.norm(f"  {file_result_text} is textual/human-readable results file")
+
+    if num_cached_results > 0:
+        log.note(f"""Reused {num_cached_results} cached results.
+If you want to start afresh then delete the {file_result_csv} file: {b.cache_results_filepath_get()}""")
+
+
+################################################################################
+# Write/create full example
+################################################################################
+
+def config_example_create():
+    if os.path.exists(config_example_dir):
+        die(f"Directory {config_example_dir} already exists. Delete it first if you want to re-create it")
+    os.makedirs(config_example_dir)
+    non_executables = [file_items, file_cmdline_args, "README"]
+
+    log.norm(f"Writing files to example config directory {config_example_dir}")
+    for filepath, contents in config_example.items():
+        path = f"{config_example_dir}/{filepath}"
+        with open(path, "w") as f:
+            f.write(contents)
+        if filepath in non_executables:
+            continue
+
+        # Make script executable
+        st = os.stat(path)
+        os.chmod(path, st.st_mode | stat.S_IEXEC)
+    files = " ".join(config_example.keys())
+    log.norm(f"Wrote files: {files}")
+
+
+stage_script_header = """\
+#!/bin/bash
+# This is a <stage> script. It is called once for each <item>.
+# When executed, current working dir is set to the output directory.
+#
+# All instances of '{stage}' and '{item}' inside this script are interpolated
+# with actual value of <stage> and <item> before writing the resulting script
+# to the output directory. It is that rewritten script that is eventually executed.
+# That makes is possible to rerun a single script (for debugging/test purposes)
+# directly from the output directory
+#
+# Environment variable CONFIGDIR is set to the absolute path of the config
+# directory (in case you have additional resources there)
+#
+# Note that <stage> scripts can be prefixed with a number if you want to
+# execute them in a well-defined order.
+
+# You can create a local working directory if you need it:
+mkdir -p {stage}
+# or one dir per <stage>/<item>
+# Note that we use {item_safe} because it substitutes a filename safe
+# value (in case <item> contains slashes or spaces)
+mkdir -p {stage}/{item_safe}
+"""
+config_example = {
+    'README': f"""\
+This directory contains the configuration, i.e. the scripts for running {prog}
+Change them as necessary and use them as inspiration
+""",
+    file_items: """\
+# List of files/items to iterate over
+/usr/lib/gcc
+/usr/lib/python3.8
+/usr/lib/firmware
+""",
+    file_cmdline_args: """\
+# This file can contain default command-line arguments
+# For instance, if you want to always use a certain output directory then
+# uncomment the next line
+#-o ~/myoutputdir
+""",
+    script_init_once: """\
+#!/bin/sh
+# This script is called only once at startup
+# You can use it for any initialization, its execution time is not added/used
+# in the execution time statistics
+
+for prog in lbzip2 pigz gzip bzip2; do
+    if which $prog >/dev/null; then
+        echo "$prog installed OK"
+    else
+        echo "$prog not installed!"
+        exit 1
+    fi
+done""",
+    script_init_item: """\
+#!/bin/bash
+# This script is called once for each <item> and after 'init_once' has been executed.
+# When executed, current working dir is set to the output directory.
+#
+# Environment variable CONFIGDIR is set to the absolute path of the config
+# directory (in case you have additional resources there)
+
+if [ ! -d {item} ]; then
+    echo "Directory/file {item}" not found
+    exit 1
+fi""",
+    "1-lbzip2": f"""\
+{stage_script_header}
+tar cf - {{item}} | /usr/bin/lbzip2 -c &> /dev/null""",
+    "2-pigz": f"""\
+{stage_script_header}
+tar cf - {{item}} | /usr/bin/pigz -c &> /dev/null""",
+    "3-gzip": f"""\
+{stage_script_header}
+tar cf - {{item}} | /usr/bin/gzip -c &> /dev/null""",
+    "4-bzip2": f"""\
+{stage_script_header}
+tar cf - {{item}} | /usr/bin/bzip2 -1 -c &> /dev/null""",
+}
+
+###############################################################################
+
+def parser_create():
+    description = f"""\
+Run/benchmark a program/procedure iterating over a list of <stages> and <items>.
+
+For example, say you want to benchmark compression tool bzip2 vs pbzip2:
+You would have <stages> = bzip2, lbzip2 and <items> would be a list
+of filenames to compress.
+
+On completion, the following files are written to the output dir
+(by default {workdir_path}/SOMEDIR where SOMEDIR is the name of current dir):
+
+  - '{file_result_text}' which is a textual summary table of results
+    The table includes elapsed time and exitcode for each <stage> and <item>
+    and the ratio of time taken compared to first <stage>
+  - '{file_result_csv}' which is a machine parseable CSV result file
+  - '<stage>.<item>' is executable script for each <stage>.<item> step
+  - '<stage>.<item>.log' is output log file for each <stage>.<item> that was executed
+
+The config directory (current directory) should contain:
+
+  '{file_items}' is the list of <items> to iterate over, one item per line
+  '{script_init_once}' is a script that is run only once at start
+  '{script_init_item}' is a script that is run once per <item>, after init
+  '<stage>' is the script that is run for each item for <stage>
+
+Before starting execution, all the scripts will have instances of '{{stage}}'
+and '{{item}}' replaced with their actual values and then the resulting
+script is written to the output dir.
+It is the scripts in the output dir that are executed. Not the scripts in
+the config directory!
+
+Each <stage>.<item> result is written to {file_result_csv} when the step run is done.
+This means you can run stages and items in any order you want and you can
+even interrupt this script. Next time you run the script, it will skip already
+executed steps, only executing those that failed with non-zero exitcode.
+You can delete lines from the {file_result_csv} file if you wanna execute those
+steps again.
+
+Furthermore:
+
+  - If only one <stage> is specified, this script simply records elapsed time and
+    exitcode for running <stage> over each <item>.
+  - With two <stages>, e.g. "old" and "new", representing old and new
+    version of a procedure, the two <stages> are effectively benchmarked vs.
+    each other.
+  - Three or more <stages> is just an extension of the former.
+"""
+    epilog = f"""
+See {prog} command-line examples with -hh
+"""
+    parser = argparse.ArgumentParser(
+        description=description, epilog=epilog, add_help=False,
+        formatter_class=argparse.RawTextHelpFormatter)
+
+    g = parser.add_argument_group("Main Options")
+    g.add_argument(nargs="*", dest="stages", metavar="STAGE",
+        help="""List of stages to iterate over.
+By default all files in current dir that start with a number are selected.
+Prefix stage with '/' to exclude it""")
+
+    g.add_argument("-i", metavar="NAME", dest="items", type=str,
+        help=f"Comma separated list of items to iterate over (overrides '{file_items}' file)")
+    g.add_argument("-o", metavar="DIR", dest="workdir", type=str,
+        help=f"""Work/output directory. Absolute path or relative to current dir.
+If prefixed with "+" it is relative to {workdir_path}.
+Default is {workdir_path}/$(basename $PWD)""")
+    g.add_argument("-t", dest="timestamp", action="store_true",
+        help=f"Append timestamp to work/output directory")
+    g.add_argument("-f", dest="force", action="store_true",
+        help=f"Force re-run of already executed steps")
+    g.add_argument("-b", dest="abort_on_error", action="count", default=0,
+        help="Bail out (stop) on error. Default is to continue")
+
+    g = parser.add_argument_group("Misc Options")
+
+    g.add_argument("-w", dest="write_example", action="store_true",
+        help=f"Write example/template configuration to {config_example_dir}")
+    g.add_argument("-n", dest="dryrun", action="store_true",
+        help=f"Dry-run")
+    g.add_argument("-v", dest="verbose", action="count", default=0,
+        help="Be a wee bit more verbose in output")
+
+    g.add_argument('-h', dest='help', action='count', default=0,
+        help='Show usage. Give option twice to see usage examples')
+
+    return parser
+
+def print_examples():
+    print(f"""\
+{prog} command-line examples:
+
+# Write example/template configuration directory
+  {prog} -w
+# Run benchmark using the config in current directory
+  {prog}
+# Make a dry run to see if everything looks fine
+  {prog} -n
+# Only run stages 'old' and 'new'
+  {prog} old new
+# Iterate over given items and skip stage 'new'
+  {prog} -i green,orange,purple /new
+# Run with output in sub-directory
+  {prog} -o foobaz
+""".rstrip())
+
+def parser_read_args_from_file(filepath):
+    args = []
+    if not os.path.isfile(filepath):
+        return args
+    for line in open(filepath, "r").readlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        args += shlex.split(line)
+
+    return args
+
+if __name__ == "__main__":
+    parser = parser_create()
+
+    args_from_file = parser_read_args_from_file(file_cmdline_args)
+    if args_from_file:
+        args = " ".join(args_from_file)
+        log.note(f"Using commandline options from {file_cmdline_args}: {args}")
+        log.note(f"All args: {args_from_file + sys.argv[1:]}")
+    opt = parser.parse_args(args_from_file + sys.argv[1:])
+
+    Ansi.enable()
+    log = Log(level=opt.verbose)
+
+    if opt.help:
+        if opt.help == 2:
+            print_examples()
+        else:
+            parser.print_help()
+        sys.exit(0)
+
+    if opt.write_example:
+        config_example_create()
+        sys.exit(0)
+
+    main()
