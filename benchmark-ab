@@ -31,12 +31,23 @@ script_init_item = "init_item"
 
 file_cmdline_args = "commandline.txt"
 
+# final raw result files contain one line per result (for plotting etc.)
+file_result_data_time = "result-time.dat"
+file_result_data_cpu = "result-cpu.dat"
 # human readable result file
-file_result_text = "results.txt"
+file_result_text = "result.txt"
 # cached result file (used to skip steps that have already been successfully executed)
 file_result_cache = "result-cache.csv"
 # Progress file that can be tailed
 file_progress = "progress.txt"
+
+# plot output filename (without suffix)
+file_result_plot = "result-histogram"
+# plot default values
+plot_size = "1200,800"
+plot_font_args = 'font "arial,24" fontscale 1.0'
+# Filename of the template GNUplot command script
+gnuplot_script = "histogram.plt"
 
 # Name of config example directory written with -w option
 config_example_dir = f"{prog_name}-example"
@@ -333,6 +344,10 @@ class Benchmark(object):
         self.workdir.mkdir(exist_ok=True, parents=True)
 
         self.filepath_cache = os.path.join(self.workdir, file_result_cache)
+        self.filepath_text = os.path.join(self.workdir, file_result_text)
+        self.filepath_data_time = os.path.join(self.workdir, file_result_data_time)
+        self.filepath_data_cpu = os.path.join(self.workdir, file_result_data_cpu)
+
         self.config_dir = os.path.abspath(config_dir)
 
         # Names of the items to work on
@@ -661,51 +676,76 @@ You can either try and fix the file or you can just delete it and restart this s
     # Result text file writing
     ###########################################################################
 
-    def write_textual_result(self):
-        filepath_text = os.path.join(self.workdir, file_result_text)
-        out = open(filepath_text, "w")
+    def write_result_files(self):
+        """
+        Write the result files:
 
-        s = get_execution_env_as_string()
-        print(f"CPU: {s}\n", file=out)
+        1. Human-readable file (that can be printed)
+        2. Raw data files that can be used for plotting with GNUplot
+           or other tools, one for elapsed-time and one for cpu-usage
+
+        The raw data file format is one item per line with columns
+        separated by whitespace (compatible with GNUplot):
+
+            <item>  <stage0 time>  <stage1 time>  ...
+        or
+            <item>  <stage0 cpu>   <stage1 cpu>   ...
+        """
+        f_text = open(self.filepath_text, "w")
+        f_time = open(self.filepath_data_time, "w")
+        f_cpu = open(self.filepath_data_cpu, "w")
+
+        s_text = get_execution_env_as_string()
+        print(f"CPU: {s_text}\n", file=f_text)
 
         init_str = "init_item "
         w_item = max([len(item) for item in self.items]) + 1
         w_prefix_item = w_item + len(init_str)
 
-        print("Initialization execution time:", file=out)
+        print("Initialization execution time:", file=f_text)
         stage = script_init_once
         if stage in self.results:
             elapsed = self.results[stage][stage].elapsed
-            print(f"{stage:{w_prefix_item}}{elapsed:6.1f}", file=out)
+            print(f"{stage:{w_prefix_item}}{elapsed:6.1f}", file=f_text)
 
         stage = script_init_item
         for item in self.items:
             elapsed = self.results[stage][item].elapsed
-            s = f"{init_str}{item}"
-            print(f"{s:{w_prefix_item}}{elapsed:6.1f}", file=out)
+            s_text = f"{init_str}{item}"
+            print(f"{s_text:{w_prefix_item}}{elapsed:6.1f}", file=f_text)
 
-        print("\nMain loop execution time results:\n", file=out)
+        print("\nMain loop execution time results:\n", file=f_text)
 
         # Print first two header lines, s1 and s2 and the separator
+        # s3 is the line for the raw data file
         s1 = "{h:{w}}".format(h="", w=w_item)
-        s2 = "{h:{w}}".format(h="Name", w=w_item)
+        s2 = "{h:{w}}".format(h="Item", w=w_item)
+        s3 = s2
         for i, stage in enumerate(self.stages):
+            s3 += f"{stage} "
             if i == 0:
+                s1 += f"{stage:>16}"
                 #      "12345678901234" (width = 14)
                 s2 += f"   time exit cpu"
-                s1 += f"{stage:>16}"
             else:
+                s1 += f"{stage:>23}"
                 #      "123456789012345678901" (width = 20)
                 s2 += f"   time exit cpu    rel"
-                s1 += f"{stage:>23}"
 
-        print(s1, file=out)
-        print(s2, file=out)
-        print("-" * len(s2), file=out)
+        print(s3, file=f_time)
+        print(s3, file=f_cpu)
+        print(s1, file=f_text)
+        print(s2, file=f_text)
+        print("-" * len(s2), file=f_text)
 
-        # Then print the actual result lines
+        # Then write the actual result lines
         for item in self.items:
-            s = f"{item:{w_item}}"
+            # s_text is the human-readable, colored output
+            s_text = f"{item:{w_item}}"
+            # s_time is the raw data output of elapsed-time values
+            s_time = f"{item:{w_item}}"
+            # s_cpu is the raw data output of cpu-usage values
+            s_cpu = f"{item:{w_item}}"
             stage_first = None
             for stage in self.stages:
                 step = self.results[stage].get(item)
@@ -713,22 +753,25 @@ You can either try and fix the file or you can just delete it and restart this s
                     continue
 
                 elapsed = f"{step.elapsed:.1f}"
-                q = f"{elapsed:>7}{step.exitcode:>5}"
+                elapsed_exitcode = f"{elapsed:>7}{step.exitcode:>5}"
 
                 if step.exitcode != 0 or step.elapsed < 0.01:
-                    s += f"{Log.style.bad}{q}{Ansi.reset}"
+                    s_text += f"{Log.style.bad}{elapsed_exitcode}{Ansi.reset}"
                 else:
-                    s += q
+                    s_text += elapsed_exitcode
 
-                q = f"{step.cpu_percent:4.0f}"
+                cpu_pct = f"{step.cpu_percent:4.0f}"
                 if step.cpu_percent < cpu_percent_bad:
-                    s += f"{Log.style.bad}{q}{Ansi.reset}"
+                    s_text += f"{Log.style.bad}{cpu_pct}{Ansi.reset}"
                 elif step.cpu_percent > cpu_percent_good:
-                    s += f"{Log.style.ok}{q}{Ansi.reset}"
+                    s_text += f"{Log.style.ok}{cpu_pct}{Ansi.reset}"
                 elif step.cpu_percent < cpu_percent_fair:
-                    s += f"{Ansi.fg.yellow}{q}{Ansi.reset}"
+                    s_text += f"{Ansi.fg.yellow}{cpu_pct}{Ansi.reset}"
                 else:
-                    s += q
+                    s_text += cpu_pct
+
+                s_time += f"{elapsed:>7}"
+                s_cpu += cpu_pct
 
                 if stage_first:
                     if step.exitcode == 0:
@@ -736,18 +779,64 @@ You can either try and fix the file or you can just delete it and restart this s
                         rel = step.elapsed / step_first.elapsed if step_first.elapsed != 0 else 99
                         if rel > 99:
                             rel = 99
-                        s += f"{rel:7.2f}"
+                        s_text += f"{rel:7.2f}"
                     else:
-                        s += " " * 6
+                        s_text += " " * 6
                 else:
                     stage_first = stage
 
-                s += f"{Ansi.reset}"
+                s_text += f"{Ansi.reset}"
 
-            print(s, file=out)
+            print(f"{item }")
+            print(s_time, file=f_time)
+            print(s_cpu, file=f_cpu)
+            print(s_text, file=f_text)
 
-        out.close()
-        print(open(filepath_text, "r").read())
+        f_time.close()
+        f_cpu.close()
+        f_text.close()
+
+    def plot_result(self):
+        """
+        See http://www.gnuplot.info/documentation.html
+
+        """
+        cmd = "which gnuplot >/dev/null"
+        exitcode = os.system(cmd)
+        if exitcode != 0:
+            log.error("Cannot run gnuplot because it is not installed")
+            return
+
+        if not os.path.isfile(gnuplot_script):
+            die(f"GNUplot script file not found: {gnuplot_script}")
+
+        # attempt to detect output file type from the plot script
+        suffix = ""
+        lines = open(gnuplot_script, "r").readlines()
+        term_lines = [x for x in lines if x.startswith("set terminal")]
+        if term_lines:
+            # if there are more matches then select the last
+            term_line = term_lines[-1]
+            if "pngcairo" in term_line:
+                suffix = ".png"
+            elif "svg" in term_line:
+                suffix = ".svg"
+        if suffix:
+            log.verb(f"Detected plot output file type '{suffix}' from {gnuplot_script}")
+        else:
+            log.warn(f"FAILED to detect plot output file type from {gnuplot_script}")
+
+        filepath_output = os.path.join(self.workdir, f"{file_result_plot}{suffix}")
+        gnuplot_cmd = f'OUTFILE=\"{filepath_output}\"; INFILE=\"{self.filepath_data_time}\"'
+        cmd = f"gnuplot -e '{gnuplot_cmd}' {gnuplot_script}"
+        log.info(f"Running gnuplot:")
+        log.norm(f"    {cmd}")
+        exitcode = run_command(cmd)
+        if exitcode != 0:
+            log.error(f"Gnuplot failed with exitcode {exitcode}")
+            return
+
+        log.norm(f"GNUplot generated histogram plot in {filepath_output}")
 
 
 ################################################################################
@@ -813,13 +902,20 @@ def main():
             break
 
     log.info("\nResults:")
-    b.write_textual_result()
+    b.write_result_files()
+    print(open(b.filepath_text, "r").read())
 
     elapsed = time.time() - started
-
     print(f"Processed {len(b.items)} items over {len(b.stages)} stages in {elapsed:.0f}s")
+    print()
+
+    b.plot_result()
+    print()
+
     log.info(f"Output files are in {b.workdir}")
     log.norm(f"  {file_result_text} is textual/human-readable results file")
+    log.norm(f"  {file_result_data_time} is raw/final results file (used for plotting)")
+    log.norm(f"  {file_result_plot} is histogram plot of final result")
     log.norm(f"  {file_result_cache} is execution result cache")
 
     if num_cached_results > 0:
@@ -835,7 +931,13 @@ def config_example_create():
     if os.path.exists(config_example_dir):
         die(f"Directory {config_example_dir} already exists. Delete it first if you want to re-create it")
     os.makedirs(config_example_dir)
-    non_executables = [file_items, file_cmdline_args, "README"]
+
+    non_executables = [
+        file_items,
+        file_cmdline_args,
+        "README",
+        gnuplot_script
+    ]
 
     log.norm(f"Writing files to example config directory {config_example_dir}")
     for filepath, contents in config_example.items():
@@ -931,7 +1033,43 @@ tar cf - {{item}} | /usr/bin/gzip -c &> /dev/null""",
     "4-bzip2": f"""\
 {stage_script_header}
 tar cf - {{item}} | /usr/bin/bzip2 -1 -c &> /dev/null""",
+
+    gnuplot_script: f"""\
+# This script contains commands for GNUplot
+# To run gnuplot manually using this script, you need to pass two arguments:
+#   INFILE is the file containing the data to plot
+#   OUTFILE is the output file (probably PNG or PNG)
+# and the gnuplot command to run is:
+#     gnuplot -e 'OUTFILE="plot.png"; INFILE="result-time.dat"' plot.plt
+#
+
+set output OUTFILE
+set title "Processing time per tool"
+# Use PNG output file format
+set terminal pngcairo enhanced size {plot_size} {plot_font_args}
+# Use SVG output file format
+#set terminal svg dynamic enhanced size {plot_size} {plot_font_args}
+# Set color sequence
+set colorsequence podo
+# Set clustered histogram plot style
+set style data histograms
+set style histogram cluster gap 1
+# Fill the histogram boxes
+set style fill solid 1.00 border lt -1
+# Make y-axis (time) start at 0
+set yrange [0:]
+set ylabel 'time/s'
+# Input file has whitespace as separator
+set datafile separator whitespace
+# Use columnheader (first line of data file) as the key title
+set key autotitle columnhead
+# Put the keys in upper left corner
+set key left top
+# Generate actual plot
+plot for [COL=2:*] INFILE using COL:xticlabels(1)
+"""
 }
+
 
 ###############################################################################
 
