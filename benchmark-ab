@@ -224,7 +224,7 @@ import concurrent.futures as futures
 def run_command(cmdline, cwd=None, logfile=None, env=None):
 
     def popen_pipe(proc, stdfile):
-        with open(logfile, "a") as f:
+        with open(logfile, "w") as f:
             while proc.poll() is None:
                 line = stdfile.readline().decode("utf8", "backslashreplace")
                 f.write(line)
@@ -358,18 +358,17 @@ class Benchmark(object):
         #     { 'A': [ Step, Step, ... ], 'B': [ Step, Step, ... ] }
         self.results = { stage:{} for stage in self.all_stages }
 
-
     def _find_scripts(self, path):
         """
-        Locate all <stage> scripts directory `path`.
+        Locate all <stage> scripts in directory `path`.
 
         :param path:
         """
-        # sys.exit(1)
+        log.verb(f"Finding executable scripts...")
         abspath = os.path.abspath(path)
         for f in sorted(os.listdir(path)):
             if not (os.path.isfile(f) and os.stat(f).st_mode & stat.S_IXUSR):
-                log.verb(f"Ignoring {f} because it is not executable")
+                log.verb(f"Ignoring non-executable file {f}")
                 continue
             if f.endswith("~") or f.endswith(".zzz"):
                 continue
@@ -488,7 +487,7 @@ Valid interpolations are: {{stage}} and {{item}}""")
         Run script for given stage and item
 
         :param stage:   stage name: something like 'a', 'b'
-        :param item:    item item
+        :param item:    item name
         :return:
         """
 
@@ -552,7 +551,7 @@ Valid interpolations are: {{stage}} and {{item}}""")
         if step.elapsed < 0.1 and exitcode != 0:
             step.cpu_percent = 0
 
-        # print to CSV/cache file
+        # write result to cached results file
         self.cached_result_write(step)
         self._write_progress(step)
 
@@ -569,7 +568,7 @@ Valid interpolations are: {{stage}} and {{item}}""")
         return exitcode
 
     ###########################################################################
-    # Cache (CSV result file)
+    # Cached results file handling
     ###########################################################################
 
     def cache_results_filepath_get(self):
@@ -770,11 +769,13 @@ def main():
 
     started = time.time()
 
+    log.info("-" * 60)
     log.info("Running global init")
     exitcode = b.execute(script_init_once)
     if exitcode != 0:
         die(f"init FAILED with exitcode = {exitcode}")
 
+    log.info("-" * 60)
     log.info("Running init once per <item>")
     for item in b.items:
         log.info(f"Running init for {item}")
@@ -782,6 +783,7 @@ def main():
         if exitcode != 0:
             die(f"prepare FAILED with exitcode = {exitcode}")
 
+    log.info("-" * 60)
     log.info("Running main benchmark loop")
     abort = False
     for item in b.items:
@@ -986,7 +988,7 @@ Default is {workdir_path}/$(basename $PWD)""")
     g.add_argument("-t", dest="timestamp", action="store_true",
         help=f"Append timestamp to work/output directory")
     g.add_argument("-f", dest="force", action="store_true",
-        help=f"Force re-run of already executed steps")
+        help=f"Force re-run of already successfully executed steps")
     g.add_argument("-b", dest="abort_on_error", action="count", default=0,
         help="Bail out (stop) on error. Default is to continue")
 
@@ -1039,9 +1041,9 @@ if __name__ == "__main__":
 
     args_from_file = parser_read_args_from_file(file_cmdline_args)
     if args_from_file:
-        args = " ".join(args_from_file)
-        log.note(f"Using commandline options from {file_cmdline_args}: {args}")
-        log.note(f"All args: {args_from_file + sys.argv[1:]}")
+        all_args = args_from_file + sys.argv[1:]
+        log.note(f"Using commandline options from {file_cmdline_args}: {' '.join(args_from_file)}")
+        log.note(f"All args: {' '.join(all_args)}")
     opt = parser.parse_args(args_from_file + sys.argv[1:])
 
     Ansi.enable()
