@@ -33,8 +33,8 @@ file_cmdline_args = "commandline.txt"
 
 # human readable result file
 file_result_text = "results.txt"
-# CSV result file (used as cache when resuming a run)
-file_result_csv = "results.csv"
+# cached result file (used to skip steps that have already been successfully executed)
+file_result_cache = "result-cache.csv"
 # Progress file that can be tailed
 file_progress = "progress.txt"
 
@@ -332,6 +332,7 @@ class Benchmark(object):
         self.workdir = workdir
         self.workdir.mkdir(exist_ok=True, parents=True)
 
+        self.filepath_cache = os.path.join(self.workdir, file_result_cache)
         self.config_dir = os.path.abspath(config_dir)
 
         # Names of the items to work on
@@ -349,8 +350,8 @@ class Benchmark(object):
         self.started = time.time()
         self.dryrun = False
 
-        # True if we already loaded file_result_csv
-        self.result_csv_loaded = False
+        # True if we already loaded file_result_cache
+        self.result_cache_loaded = False
 
         self._find_scripts(config_dir)
 
@@ -571,33 +572,45 @@ Valid interpolations are: {{stage}} and {{item}}""")
     # Cached results file handling
     ###########################################################################
 
-    def cache_results_filepath_get(self):
-        return os.path.join(self.workdir, file_result_csv)
-
     def cached_result_create_file(self):
-        # If CSV result file does not exist, write ISO8601 date
-        # and CPU model as a comment lines
-        self.cached_result_write_raw(f"# {datetime.now().isoformat()}")
-        s = get_execution_env_as_string()
-        self.cached_result_write_raw(f"# {s}")
-        self.cached_result_write_raw(f"#")
-        s = "stage,item,elapsed,cpu_percent,exitcode"
-        self.cached_result_write_raw(f"# {s}\n")
+        """
+        If cached result file does not exist, write ISO8601 date
+        and CPU model as a comment lines
+        """
+        if os.path.isfile(self.filepath_cache):
+            return
+
+        header = f"""\
+# This file contains cached results of previous runs
+# It is used for two purposes:
+#   1. Determine which stages/items can be skipped because they have
+#      already been executed successfully (exitcode 0)
+#   2. Provide progress of currently running benchmark-ab if you run the
+#      command 'tail -f' on the file
+#
+# File created {datetime.now().isoformat()}
+# Executed on  {get_execution_env_as_string()}
+#
+# stage,item,elapsed,cpu_percent,exitcode
+"""
+        self.cached_result_write_raw(header)
 
     def cached_result_write(self, step: Step):
-        if self.dryrun or step.stage in (script_init_once, script_init_item):
+        if self.dryrun:
+            log.info(f"dryrun: skipping write of cached result {step.stage},{step.item}")
+            return
+        if step.stage in (script_init_once, script_init_item):
             return
         line = f"{step.stage},{step.item},{step.elapsed:.1f},{step.cpu_percent:.1f},{step.exitcode}"
         self.cached_result_write_raw(line)
 
     def cached_result_write_raw(self, s):
-        filepath_csv = self.cache_results_filepath_get()
-        with open(filepath_csv, "a+") as fp:
+        with open(self.filepath_cache, "a+") as fp:
             print(s, file=fp)
             fp.flush()
 
     def cached_result_get(self, stage, item):
-        if not self.result_csv_loaded:
+        if not self.result_cache_loaded:
             return
 
         if stage in (script_init_once, script_init_once):
@@ -613,13 +626,12 @@ Valid interpolations are: {{stage}} and {{item}}""")
 
         :return:
         """
-        filepath = self.cache_results_filepath_get()
-        if not os.path.isfile(filepath):
+        if not os.path.isfile(self.filepath_cache):
             return 0
 
         num_unique = 0
-        log.note(f"Reading cached results from {filepath}")
-        lines = open(filepath, "r").readlines()
+        log.note(f"Reading cached results from {self.filepath_cache}")
+        lines = open(self.filepath_cache, "r").readlines()
         try:
             for linenum, line in enumerate(lines):
                 line = line.strip()
@@ -636,12 +648,12 @@ Valid interpolations are: {{stage}} and {{item}}""")
                 self.results[stage][item] = step
         except (KeyError, ValueError) as e:
             die(f"""{e}
-       Failed to load and parse {filepath} at line {linenum}: {line}
-       Maybe because the stage scripts were renamed or the result file format changed?
-       You can either try and fix the file or you can just delete it and restart this script""")
+Failed to load and parse {self.filepath_cache} at line {linenum}: {line}
+Maybe because the stage scripts were renamed or the result file format changed?
+You can either try and fix the file or you can just delete it and restart this script""")
 
-        self.result_csv_loaded = True
-        log.note(f"Loaded {num_unique} results ({len(lines)} lines) from {filepath}")
+        self.result_cache_loaded = True
+        log.note(f"Loaded {num_unique} results ({len(lines)} lines) from {self.filepath_cache}")
         return num_unique
 
 
@@ -762,7 +774,8 @@ def main():
         num_cached_results = b.cached_results_load()
         if num_cached_results > 0:
             log.note(f"""Resuming previous run based on cached results.
-    If you want to start afresh then delete the {file_result_csv} file: {b.cache_results_filepath_get()}""")
+    Note that only stages/items with non-zero exitcode will be executed.
+    If you want to start afresh then delete the {file_result_cache} file: {b.filepath_cache}""")
         else:
             # If CSV result file does not exist, create it with header
             b.cached_result_create_file()
@@ -803,12 +816,12 @@ def main():
 
     print(f"Processed {len(b.items)} items over {len(b.stages)} stages in {elapsed:.0f}s")
     log.info(f"Output files are in {b.workdir}")
-    log.norm(f"  {file_result_csv} is CSV file of results")
     log.norm(f"  {file_result_text} is textual/human-readable results file")
+    log.norm(f"  {file_result_cache} is execution result cache")
 
     if num_cached_results > 0:
-        log.note(f"""Reused {num_cached_results} cached results.
-If you want to start afresh then delete the {file_result_csv} file: {b.cache_results_filepath_get()}""")
+        log.note(f"""Loaded and used {num_cached_results} cached results.
+If you want to start afresh then delete the {file_result_cache} file: {b.filepath_cache}""")
 
 
 ################################################################################
@@ -933,7 +946,7 @@ On completion, the following files are written to the output dir
   - '{file_result_text}' which is a textual summary table of results
     The table includes elapsed time and exitcode for each <stage> and <item>
     and the ratio of time taken compared to first <stage>
-  - '{file_result_csv}' which is a machine parseable CSV result file
+  - '{file_result_cache}' which is a machine parseable execution result file (CSV)
   - '<stage>.<item>' is executable script for each <stage>.<item> step
   - '<stage>.<item>.log' is output log file for each <stage>.<item> that was executed
 
@@ -950,11 +963,11 @@ script is written to the output dir.
 It is the scripts in the output dir that are executed. Not the scripts in
 the config directory!
 
-Each <stage>.<item> result is written to {file_result_csv} when the step run is done.
+Each <stage>.<item> result is written to {file_result_cache} when the step run is done.
 This means you can run stages and items in any order you want and you can
 even interrupt this script. Next time you run the script, it will skip already
 executed steps, only executing those that failed with non-zero exitcode.
-You can delete lines from the {file_result_csv} file if you wanna execute those
+You can delete lines from the {file_result_cache} file if you wanna execute those
 steps again.
 
 Furthermore:
