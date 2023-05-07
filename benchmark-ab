@@ -799,9 +799,12 @@ def main():
     log.info("-" * 60)
     log.info("Running main benchmark loop")
     abort = False
+    num = 0
+    num_total = len(b.items) * len(b.stages)
     for item in b.items:
         for stage in b.stages:
-            log.info(f"Executing stage '{stage}' with item '{item}'")
+            num += 1
+            log.info(f"[{num:2}/{num_total}] Executing stage '{stage}' with item '{item}'")
             exitcode = b.execute(stage, item)
             abort = (exitcode != 0 and opt.abort_on_error)
             if abort:
