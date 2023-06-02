@@ -78,3 +78,12 @@ Output files are in /tmp/benchmark-ab/benchmark-ab-example
 
 Additionally, the following histogram plot is generated:
 ![result-histogram.png](result-histogram.png)
+
+
+## Installation
+
+Install with:
+
+```
+pip install git+https://github.com/mmeisner/benchmark-ab.git
+```
