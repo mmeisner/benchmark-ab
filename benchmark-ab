@@ -843,6 +843,8 @@ You can either try and fix the file or you can just delete it and restart this s
 
 def main():
     workdir = make_workdir_path(default_path=workdir_path, workdir=opt.workdir, with_ts=opt.timestamp)
+    if not os.path.islink("workdir"):
+        os.symlink(workdir, "workdir", target_is_directory=True)
     b = Benchmark(workdir=workdir)
     b.dryrun = opt.dryrun
 
