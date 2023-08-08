@@ -1063,6 +1063,8 @@ set yrange [0:]
 set ylabel 'time/s'
 # Input file has whitespace as separator
 set datafile separator whitespace
+# Rotate x-axis labels by 45 degrees
+set xtics rotate by 45 right
 # Use columnheader (first line of data file) as the key title
 set key autotitle columnhead
 # Put the keys in upper left corner
